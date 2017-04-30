@@ -10,6 +10,6 @@ TensorFlow implementation of [Neural Combinatorial Optimization with Reinforceme
 
 ## Authors
 
-Michel Deudon / [@mdeudon](https://github.com/pcournut)
+Michel Deudon / [@mdeudon](https://github.com/MichelDeudon)
 
 Pierre Cournut / [@pcournut](https://github.com/pcournut)
