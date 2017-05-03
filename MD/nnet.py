@@ -9,16 +9,25 @@ import dataset
 # TODO
 
 """
-- Optimize network (POLICY GRADIENT REINFORCE or GUMBEL SOFTMAX): W_embed, cell1, decod_fst_input, cell2, W_ref, W_q, v
-    Actor - Critic
-- Variable seq length
-- GAN
+Michel:
+- Variable seq length ****
+- TSP with soft time windows ***
+- Replace coordinates by KNN distances (K=p+1) ***
 
-- import argparse
+- Replace reward by -length(tour + AR non visited cities) ***
+- (Actor-)Critic for reward baseline ****
+
+
+Pierre
+- GAN (Discriminator CNN) ****
+- Supervised setting: Cplex, Concorde... ***
+- Back prop ***
+
+
+- import argparse (config)
 - Summary writer (log)...
 - Parallelize (GPU), C++...
 - Nice plots, interface...
-- Compare results to other solvers
 """
 
 
@@ -36,6 +45,7 @@ class EncDecModel(object):
         self.hidden_dim= args['num_neurons'] # same thing...
         self.initializer = tf.random_uniform_initializer(-args['init_range'], args['init_range']) # variables initializer
         self.step=0 # int to reuse_variable in scope
+        self.baseline=args['init_baseline']
 
         self.build_model()
         self.build_reward()
@@ -49,7 +59,7 @@ class EncDecModel(object):
         self.X = tf.placeholder(tf.float32, [self.batch_size, self.max_length, self.input_dimension], name="Input")
 
         # Embed input sequence
-        self.W_embed = tf.Variable(tf.truncated_normal([1,self.input_dimension,self.input_embed]), name="W_ref")
+        self.W_embed = tf.Variable(tf.truncated_normal([1,self.input_dimension,self.input_embed]), name="W_embed")
         with tf.variable_scope("Embed"):
             if self.step>0:
                 tf.get_variable_scope().reuse_variables()
@@ -66,7 +76,8 @@ class EncDecModel(object):
         self.decoder_initial_state = self.encoder_state ### NOTE: if state_tuple=True, self.decoder_initial_state = (c,h) ###
 
         # DECODER initial input is 'GO', a variable tensor
-        self.decoder_first_input = tf.cast(tf.Variable(tf.truncated_normal([self.batch_size,self.hidden_dim]), name="GO"),tf.float32) #tf.constant(0.1, shape=[self.batch_size,self.hidden_dim]) #
+        #self.decoder_first_input = tf.cast(tf.Variable(tf.truncated_normal([self.batch_size,self.hidden_dim]), name="GO"),tf.float32) #tf.constant(0.1, shape=[self.batch_size,self.hidden_dim]) #
+        self.decoder_first_input = tf.Variable(tf.truncated_normal([self.batch_size,self.hidden_dim]), name="GO")
 
         # DECODER LSTM cell        
         self.cell2 = LSTMCell(self.num_neurons,initializer=self.initializer)
@@ -123,56 +134,52 @@ class EncDecModel(object):
 
 
     def build_optim(self):
-        self.reward_baseline=tf.expand_dims((self.reward-30),1) # [Batch size, 1, 1]
+        self.opt = tf.train.AdamOptimizer() # optimizer 
 
-        self.gradient_v=tf.matmul(self.reward_baseline,self.ptr.seq_grad_v) # [Batch size, 1, n_hidden]
-        self.gradient_v=tf.reshape(tf.reduce_sum(self.gradient_v,0),[-1]) # [Batch size, 1, n_hidden] to [1, n_hidden] to [n_hidden]
-        
+        # Discounted reward
+        self.reward_baseline=tf.stop_gradient(self.reward-self.baseline) # [Batch size, 1]
+
+        # Loss
+        self.loss=tf.reduce_sum(tf.multiply(self.ptr.log_softmax,self.reward_baseline),0)/self.batch_size
+
+        # Loss=self.outputs
         """
-        self.gradient_W_q=[]
-        for k in range(self.batch_size):
-            self.gradient_W_q.append(self.reward_baseline[k]*self.ptr.seq_grad_W_q[k])
-        self.gradient_W_q=tf.stack(self.gradient_W_q,0)
-        self.gradient_W_q=tf.reduce_sum(self.gradient_W_q,0)
+        self.cellW2 = [v for v in tf.trainable_variables() if v.name == "Decode/lstm_cell/weights:0"][0]
+
+        var=[self.ptr.v,self.ptr.W_q,self.ptr.W_ref]
+
+        self.compute_grad_step = self.opt.compute_gradients(self.loss,var_list=var)
+
+        self.grad_v, _ = self.compute_grad_step[0] # grav v, v
+        self.grad_W_q, _ = self.compute_grad_step[1] 
+        self.grad_W_ref, _ = self.compute_grad_step[2]
+
+        self.train_step = self.opt.apply_gradients([(self.grad_v,self.ptr.v),(self.grad_W_q,self.ptr.W_q),(self.grad_W_ref,self.ptr.W_ref)]) # minimize operation #
         """
-        
-        self.opt = tf.train.AdamOptimizer() # optimize 
-        self.train_step = self.opt.apply_gradients([(self.gradient_v,self.ptr.v)]) # minimize operation #(self.gradient_W_q,self.ptr.W_q)
+
+        self.train_step = self.opt.minimize(self.loss)
         
 
 
     def run_episode(self,sess):
 
         # Get feed_dict
-        print("\n Getting Dataset...")
         training_set = dataset.DataGenerator()
         inp = training_set.next_batch(self.batch_size, self.max_length, self.input_dimension)
         feed = {self.X: inp}
 
         # Forward pass
-        seq_input, permutation, circuit_length, penality, reward, proba, seq_proba, gradient_v = sess.run([self.X,self.positions,self.distances,self.penality,self.reward,self.proba, self.seq_proba, self.gradient_v], feed_dict=feed)
-        print('\n Input: \n', seq_input)
-        print('\n Permutation: \n', permutation)
-        print('\n Circuit length: \n',circuit_length)
-        print('\n Number of cities visited (+10 bonus / city) :\n', penality)
-        print('\n Reward - baseline: \n', reward-30)
+        seq_input, permutation, circuit_length, cities_visited, reward, seq_proba = sess.run([self.X,self.positions,self.distances,self.penality,self.reward, self.seq_proba], feed_dict=feed)
 
-        #print('\n Attention proba: \n', proba) # [Batch size, Prob step i (over n ref), number of step (=n)]
-        print('\n Seq proba: \n', seq_proba)
-
-        #print('\n Seq_grad_v: \n', sess.run(self.ptr.seq_grad_v,feed_dict=feed))
-        #print('\n Grad_v: \n', gradient_v)
-
-        print('\n Seq_grad_W_q: \n', sess.run(self.ptr.seq_grad_W_q,feed_dict=feed)) #self.ptr.seq_grad_W_q
-        #print('\n V before grad: \n', self.ptr.v.eval())
-        sess.run(self.train_step, feed_dict=feed)
-        #print('\n V after grad: \n', self.ptr.v.eval())
-
-
+        # Train step
+        loss, train_step = sess.run([self.loss,self.train_step],feed_dict=feed)
         self.step+=1
-        
-        print('\n')
 
+        # Update baseline
+        if self.step%100==0:
+            self.baseline+=1
+
+        return seq_input, permutation, circuit_length, cities_visited, reward, seq_proba, loss, train_step
 
 
 
@@ -185,12 +192,13 @@ def train():
 
     # Config
     args={}
-    args['batch_size']=2
-    args['max_length']=4
+    args['batch_size']=32
+    args['max_length']=6
     args['input_dimension']=2
-    args['input_embed']=5
-    args['num_neurons']=5
-    args['init_range']=3
+    args['init_baseline']=25
+    args['input_embed']=32
+    args['num_neurons']=256
+    args['init_range']=0.1
 
     # Build Model and Reward
     print("Initializing the Model...")
@@ -209,23 +217,28 @@ def train():
         print('* Embedding:',model.input_embed)
         print('* Num neurons (Encoder & Decoder LSTM cell):',model.num_neurons)
         print('\n')
-        """
-        print('Tensors shape:')
-        print('* Input:','[',model.batch_size,',', model.max_length,',', model.input_dimension,']')
-        print('* Embedded input:','[',model.batch_size,',',model.max_length,',',model.input_embed,']')
-        print('* Encoder & Decoder output activations and hidden state:','[',model.batch_size,',', model.max_length,',', model.hidden_dim,']')
-        print('* Decoder input:','[',model.batch_size,',', model.hidden_dim,']')
-        print('* Attention matrices W_ref, W_q:','[',model.hidden_dim,',',model.hidden_dim,']')
-        print('* Attention vector v:','[',model.hidden_dim,']')
-        print('\n')
-        """
 
-        for i in tqdm(range(10)): # epoch i
+        for i in tqdm(range(500)): # epoch i
 
-            model.run_episode(sess)
+            seq_input, permutation, circuit_length, cities_visited, reward, seq_proba, loss, train_step = model.run_episode(sess)
+
+            if i % 100 == 0:
+                #print('\n Input: \n', seq_input)
+                #print('\n Permutation: \n', permutation)
+                #print('\n Circuit length: \n',circuit_length)
+                print('\n Average number of cities visited :', sess.run(tf.reduce_mean(tf.cast(cities_visited,tf.float32))))
+                print(' Baseline :', model.baseline)
+                print(' Average Reward:', sess.run(tf.reduce_mean(reward)))
+                print(' Loss:', loss)
+                #print('\n Log softmax: \n', sess.run(self.ptr.log_softmax,feed_dict=feed))
+                print('\n')
 
             if i % 1000 == 0 and not(i == 0):
                 saver.save(sess,"save/" +str(i) +".ckpt")
+
+        print('\n Trainable variables')
+        for v in tf.trainable_variables():
+            print(v.name)
 
         print("Training is COMPLETE!")
         saver.save(sess,"save/model.ckpt")

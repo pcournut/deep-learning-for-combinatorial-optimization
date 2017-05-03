@@ -25,39 +25,20 @@ class pointer_decoder(object):
         self.W_q = tf.Variable(tf.truncated_normal([self.n_hidden, self.n_hidden]), name="W_q")
         self.v = tf.Variable(tf.truncated_normal([self.n_hidden]), name="v")
 
-        self.seq_grad_W_ref=[]
-        self.seq_grad_W_q=[]
-        self.seq_grad_v=[]
+        self.log_softmax=[]
 
         # Initialize lists to return
         self.outputs,self.states,self.positions,self.inputs,self.proba=[],[],[],[],[]
 
     # Attention mechanism takes a query (decoder output) [Batch size, n_hidden] and a set of reference (encoder_output) [Batch size, seq_length, n_hidden] 
     # as input to predict a distribution over next decoder input
-    def attention(self,ref, query, with_softmax=True):
+    def attention(self,ref, query):
 
         encoded_ref = tf.nn.conv1d(ref, self.W_ref, 1, "VALID", name="encoded_ref") # [Batch size, seq_length, n_hidden]
         encoded_query = tf.expand_dims(tf.matmul(query, self.W_q, name="encoded_query"), 1) # [Batch size, 1, n_hidden]
         scores = tf.reduce_sum(self.v * tf.tanh(encoded_ref + encoded_query), [-1]) # [Batch size, seq_length]
 
-
-        inv_soft = tf.expand_dims((1-tf.nn.softmax(scores)),1) # [Batch size, 1, seq_length]
-        tan = tf.tanh(encoded_ref + encoded_query) # [Batch size, seq_length, n_hidden]
-        v_batch_grad = tf.matmul(inv_soft,tan) # [Batch size, 1, n_hidden]
-        self.seq_grad_v.append(v_batch_grad)
-
-        inv_tan2=1-tf.square(tan) # [Batch size, seq_length, n_hidden]
-        invsoft_x_invtan2 = tf.matmul(inv_soft,inv_tan2) # [Batch size, 1, n_hidden]
-        v_t = tf.tile(tf.expand_dims(tf.expand_dims(self.v,0),0),[tf.cast(self.batch_size,tf.int32),1,1])  # [Batch size, 1, n_hidden]
-        invsoft_x_invtan2_x_vt = tf.matmul(v_t,invsoft_x_invtan2,transpose_a=True) # [Batch size, n_hidden, n_hidden]
-        invsoft_x_invtan2_x_vt_x_q = tf.multiply(invsoft_x_invtan2_x_vt,tf.expand_dims(query,1)) # [Batch size, n_hidden, n_hidden]
-        self.seq_grad_W_q.append(invsoft_x_invtan2_x_vt_x_q)
-
-
-        if with_softmax:
-            return tf.nn.softmax(scores)
-        else:
-            return scores
+        return tf.nn.softmax(scores), scores
 
     # One pass of the decode mechanism
     def decode(self,prev_input,prev_state,timestep):
@@ -67,7 +48,10 @@ class pointer_decoder(object):
             # First, we run the cell on a combination of the previous input and state
             output,state=self.cell(prev_input,prev_state)
             # Then, we calculate new attention mask and take the arg_max index
-            distribution=self.attention(self.encoder_output,output)
+            distribution, scores =self.attention(self.encoder_output,output)
+
+            self.log_softmax.append(tf.log(distribution+0.0000001))
+
             position = tf.arg_max(distribution,1)       ######################## GUMBEL SOFTMAX ! ##########################
             position = tf.cast(position,tf.int32)
             # We select the decoder's new input
@@ -81,7 +65,7 @@ class pointer_decoder(object):
         # decoder_first_input: Tensor [batch_size x cell.state_size]
 
         # Loop the decoding process and collect results
-        o,s,p,i= None,decoder_initial_state,None,decoder_first_input
+        o,s,p,i= None,decoder_initial_state,None,tf.cast(decoder_first_input,tf.float32)
         for step in range(self.seq_length):
             o,s,p,i,d= self.decode(i,s,step)
             self.outputs.append(o)
@@ -91,8 +75,7 @@ class pointer_decoder(object):
             self.proba.append(d)
 
 
-        self.seq_grad_v=tf.reduce_sum(self.seq_grad_v,0) # seq_length * [Batch size, 1, n_hidden] to [Batch size, 1, n_hidden]
-        self.seq_grad_W_q=self.seq_grad_W_q[0]    #tf.reduce_sum(self.seq_grad_W_q,0) # seq_length * [Batch size, n_hidden, n_hidden] to [Batch size, n_hidden, n_hidden]
+        self.log_softmax=tf.reduce_sum(self.log_softmax,0)
 
 
         # Stack lists to tensors
