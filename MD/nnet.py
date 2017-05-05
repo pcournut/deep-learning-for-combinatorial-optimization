@@ -11,14 +11,6 @@ import matplotlib.pyplot as plt
 # TODO
 
 """
-
- 
-+ GIT 
-
-+ MAIL (Git + synthèse)
-
-
-
 Michel:
 _____________________________________________________________________
 
