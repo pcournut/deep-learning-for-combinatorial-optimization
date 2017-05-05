@@ -5,27 +5,58 @@ from tqdm import tqdm
 from decoder import pointer_decoder
 import dataset
 
+import matplotlib.pyplot as plt
+
 
 # TODO
 
 """
+
+ 
++ GIT 
+
++ MAIL (Git + synthèse)
+
+
+
 Michel:
-- Variable seq length ****
-- TSP with soft time windows ***
-- Replace coordinates by KNN distances (K=p+1) ***
+_____________________________________________________________________
 
-- Replace reward by -length(tour + AR non visited cities) ***
-- (Actor-)Critic for reward baseline ****
+- Plot tour with networkx
 
+- Try Google's parameters
+
+- Normalize input (scale distances) + reorder sequence
+
+- Add bidirectional encoder, Dropout, Layers...
+
+- Improve baseline estimate (CNN vs. FFN)
+_____________________________________________________________________
+
+- Variable seq length (padding) ****
+
+- TSP with soft time windows (add exp loss) ***
+  (+ use Graph Theory : Coreness, Connectivity (or Katz_beta), Closeness, Betweeness, Cluster... & Topological descriptors - Reeb filtration ?)
+_____________________________________________________________________
+
+- Gumbel Softmax ?
+
+- Monte Carlo Tree Search ?
+_____________________________________________________________________
 
 Pierre
-- GAN (Discriminator CNN) ****
+- GAN (Discriminator CNN, Wasserstein...): pretrain ****
 - Supervised setting: Cplex, Concorde... ***
 - Back prop ***
+_____________________________________________________________________
 
+- Save & load model
+
+- Use varscope, graph...
 
 - import argparse (config)
 - Summary writer (log)...
+
 - Parallelize (GPU), C++...
 - Nice plots, interface...
 """
@@ -40,51 +71,77 @@ class EncDecModel(object):
         self.batch_size=args['batch_size'] # batch size
         self.max_length = args['max_length'] # input sequence length (number of cities)
         self.input_dimension = args['input_dimension'] # dimension of a city (coordinates)
-        self.input_embed=args['input_embed'] # dimension of embedding space (input)
-        self.num_neurons = args['num_neurons'] # dimension of hidden states (LSTM cell)
+        self.K = self.input_dimension+1 # for KNN
+        self.input_new_dimension  = self.input_dimension+2*self.K+1 # x,y + kNN index + kNN dist + indegree_ft (>0 for a hub)
+        self.input_embed=args['input_embed'] # dimension of embedding space (actor)
+        self.input_embed_c=args['input_embed'] # dimension of embedding space (critic)
+        self.num_neurons = args['num_neurons'] # dimension of hidden states (actor LSTM cell)
+        self.num_neurons_c = args['num_neurons'] # dimension of hidden states (critic LSTM cell)
         self.hidden_dim= args['num_neurons'] # same thing...
         self.initializer = tf.random_uniform_initializer(-args['init_range'], args['init_range']) # variables initializer
         self.step=0 # int to reuse_variable in scope
-        self.baseline=args['init_baseline']
+        self.init_bias_c = args['init_bias_c'] # initial bias for critic
+        self.temperature_decay = args['temperature_decay'] # temperature decay rate
 
-        self.build_model()
+        self.build_actor()
+        self.build_critic()
         self.build_reward()
         self.build_optim()
 
 
 
-    def build_model(self):
+    def build_actor(self):
 
-        # Tensor block holding the input sequences [Batch Size, Sequence Length, Features]
-        self.X = tf.placeholder(tf.float32, [self.batch_size, self.max_length, self.input_dimension], name="Input")
+        # Tensor blocks holding the input sequences [Batch Size, Sequence Length, Features]
+        self.input_coordinates = tf.placeholder(tf.float32, [self.batch_size, self.max_length, self.input_dimension], name="Input")
+        self.input_description = tf.placeholder(tf.float32, [self.batch_size, self.max_length, self.input_new_dimension], name="Input")
 
         # Embed input sequence
-        self.W_embed = tf.Variable(tf.truncated_normal([1,self.input_dimension,self.input_embed]), name="W_embed")
+        W_embed = tf.Variable(tf.truncated_normal([1,self.input_new_dimension,self.input_embed]), name="W_embed")
         with tf.variable_scope("Embed"):
             if self.step>0:
                 tf.get_variable_scope().reuse_variables()
-            self.embeded_input = tf.nn.conv1d(self.X, self.W_embed, 1, "VALID", name="EncoderInput")
+            embeded_input = tf.nn.conv1d(self.input_description, W_embed, 1, "VALID", name="EncoderInput")
 
         # ENCODER LSTM cell
-        self.cell1 = LSTMCell(self.num_neurons,initializer=self.initializer)   # Or GRUCell(num_neurons)
-        #cell = DropoutWrapper(cell, output_keep_prob=dropout) or MultiRNNCell([cell] * num_layers)
-
+        cell1 = LSTMCell(self.num_neurons,initializer=self.initializer)   # cell = DropoutWrapper(cell, output_keep_prob=dropout) or MultiRNNCell([cell] * num_layers)
         # RNN-ENCODER returns the output activations [Batch size, Sequence Length, Num_neurons] and last hidden state as tensors.
-        self.encoder_output, self.encoder_state = tf.nn.dynamic_rnn(self.cell1, self.embeded_input, dtype=tf.float32) ### NOTE: encoder_output is the ref for attention ###
+        encoder_output, encoder_state = tf.nn.dynamic_rnn(cell1, embeded_input, dtype=tf.float32) ### NOTE: encoder_output is the ref for attention ###
 
         # DECODER initial state is the last relevant state from encoder
-        self.decoder_initial_state = self.encoder_state ### NOTE: if state_tuple=True, self.decoder_initial_state = (c,h) ###
-
+        decoder_initial_state = encoder_state ### NOTE: if state_tuple=True, self.decoder_initial_state = (c,h) ###
         # DECODER initial input is 'GO', a variable tensor
-        #self.decoder_first_input = tf.cast(tf.Variable(tf.truncated_normal([self.batch_size,self.hidden_dim]), name="GO"),tf.float32) #tf.constant(0.1, shape=[self.batch_size,self.hidden_dim]) #
-        self.decoder_first_input = tf.Variable(tf.truncated_normal([self.batch_size,self.hidden_dim]), name="GO")
-
+        decoder_first_input = tf.Variable(tf.truncated_normal([self.batch_size,self.hidden_dim]), name="GO")
         # DECODER LSTM cell        
-        self.cell2 = LSTMCell(self.num_neurons,initializer=self.initializer)
+        cell2 = LSTMCell(self.num_neurons,initializer=self.initializer)
 
         # POINTER-DECODER returns the output activations, hidden states, hard attention and decoder inputs as tensors.
-        self.ptr = pointer_decoder(self.encoder_output, self.cell2)
-        self.outputs, self.states, self.positions, self.inputs, self.proba = self.ptr.loop_decode(self.decoder_initial_state, self.decoder_first_input)
+        self.ptr = pointer_decoder(encoder_output, cell2)
+        self.positions, self.proba, self.log_softmax = self.ptr.loop_decode(decoder_initial_state, decoder_first_input)
+
+
+
+    def build_critic(self):
+
+        # Embed input sequence (for critic)
+        W_embed_c = tf.Variable(tf.truncated_normal([1,self.input_new_dimension,self.input_embed_c]), name="critic_W_embed")
+        with tf.variable_scope("Critic"):
+            if self.step>0:
+                tf.get_variable_scope().reuse_variables()
+            embeded_input_c = tf.nn.conv1d(self.input_description, W_embed_c, 1, "VALID", name="Critic_EncoderInput")
+
+            # ENCODER LSTM cell
+            cell_c = LSTMCell(self.num_neurons_c,initializer=self.initializer)   # cell = DropoutWrapper(cell, output_keep_prob=dropout) or MultiRNNCell([cell] * num_layers)
+
+            # RNN-ENCODER returns the output activations [Batch size, Sequence Length, Num_neurons] and last hidden state as tensors.
+            encoder_output_c, encoder_state_c = tf.nn.dynamic_rnn(cell_c, embeded_input_c, dtype=tf.float32)
+            encoder_output_c = tf.transpose(encoder_output_c, [1, 0, 2]) # transpose time axis first [time steps x Batch size x num_neurons]
+            last_c = tf.gather(encoder_output_c, int(encoder_output_c.get_shape()[0]) - 1) # select last frame [Batch size x num_neurons]
+
+        ### DO A CONVOLUTION HERE INSTEAD OF A FFN !!! ###
+        weight_c = tf.Variable(tf.truncated_normal([self.num_neurons_c, 1], stddev=0.1))
+        bias_c = tf.Variable(tf.constant(self.init_bias_c, shape=[1]))
+        self.prediction_c = tf.matmul(last_c, weight_c) + bias_c
 
 
 
@@ -94,7 +151,7 @@ class EncDecModel(object):
         tours=[]
         shifted_tours=[]
         for k in range(self.batch_size):
-            strip=tf.gather_nd(self.X,[k])
+            strip=tf.gather_nd(self.input_coordinates,[k])
             tour=tf.gather_nd(strip,tf.expand_dims(self.positions[k],1))
             tours.append(tour)
             # Shift tour to calculate tour length
@@ -112,52 +169,28 @@ class EncDecModel(object):
         # Reduce to obtain tour length
         self.distances=tf.expand_dims(tf.reduce_sum(euclidean_distances,axis=1),1)
 
-        # Get number of cities visited
-        counter=[]
-        for k in range(self.batch_size):
-            y, idx, count = tf.unique_with_counts(self.positions[k])
-            counter.append(tf.shape(y))
-        self.penality=tf.stack(counter,0)
-        
         # Define reward from objective and penalty
-        alpha=10
-        self.reward=alpha*tf.cast(self.penality,tf.float32)-tf.cast(self.distances,tf.float32)
-
-        output_prob = []
-        for k in range(self.batch_size):
-            seq_proba=[]
-            for kk in range(self.max_length):
-                seq_proba.append(self.proba[k][kk][self.positions[k][kk]])
-            output_prob.append(tf.stack(seq_proba,0))
-        self.seq_proba=tf.stack(output_prob,0)
+        self.reward = -tf.cast(self.distances,tf.float32)
 
 
 
     def build_optim(self):
-        self.opt = tf.train.AdamOptimizer() # optimizer 
 
+        # ACTOR Optimizer
+        self.opt1 = tf.train.AdamOptimizer(learning_rate=0.01,beta1=0.9,beta2=0.9,epsilon=0.1) 
         # Discounted reward
-        self.reward_baseline=tf.stop_gradient(self.reward-self.baseline) # [Batch size, 1]
-
+        self.reward_baseline=tf.stop_gradient(self.reward-self.prediction_c) # [Batch size, 1]
         # Loss
-        self.loss=tf.reduce_sum(tf.multiply(self.ptr.log_softmax,self.reward_baseline),0)/self.batch_size
+        self.loss1=tf.reduce_sum(tf.multiply(self.log_softmax,self.reward_baseline),0)/self.batch_size
+        # Minimize step
+        self.train_step1 = self.opt1.minimize(self.loss1)
 
-        # Loss=self.outputs
-        """
-        self.cellW2 = [v for v in tf.trainable_variables() if v.name == "Decode/lstm_cell/weights:0"][0]
-
-        var=[self.ptr.v,self.ptr.W_q,self.ptr.W_ref]
-
-        self.compute_grad_step = self.opt.compute_gradients(self.loss,var_list=var)
-
-        self.grad_v, _ = self.compute_grad_step[0] # grav v, v
-        self.grad_W_q, _ = self.compute_grad_step[1] 
-        self.grad_W_ref, _ = self.compute_grad_step[2]
-
-        self.train_step = self.opt.apply_gradients([(self.grad_v,self.ptr.v),(self.grad_W_q,self.ptr.W_q),(self.grad_W_ref,self.ptr.W_ref)]) # minimize operation #
-        """
-
-        self.train_step = self.opt.minimize(self.loss)
+        # Critic Optimizer
+        self.opt2 = tf.train.AdamOptimizer(learning_rate=0.01,beta1=0.9,beta2=0.9,epsilon=0.1)
+        # Loss
+        self.loss2=tf.losses.mean_squared_error(self.reward,self.prediction_c)
+        # Minimize step
+        self.train_step2 = self.opt2.minimize(self.loss2)
         
 
 
@@ -165,21 +198,30 @@ class EncDecModel(object):
 
         # Get feed_dict
         training_set = dataset.DataGenerator()
-        inp = training_set.next_batch(self.batch_size, self.max_length, self.input_dimension)
-        feed = {self.X: inp}
+        coord_batch, dist_batch, input_batch = training_set.next_batch(self.batch_size, self.max_length, self.input_dimension)
+        feed = {self.input_coordinates: coord_batch, self.input_description: input_batch}
 
-        # Forward pass
-        seq_input, permutation, circuit_length, cities_visited, reward, seq_proba = sess.run([self.X,self.positions,self.distances,self.penality,self.reward, self.seq_proba], feed_dict=feed)
+        # Actor Forward pass
+        seq_input, permutation, seq_proba = sess.run([self.input_coordinates,self.positions,self.proba],feed_dict=feed)
+
+        # Critic Forward pass
+        b_s = sess.run(self.prediction_c,feed_dict=feed)
+
+        # Environment response
+        trip, circuit_length, reward = sess.run([self.trip,self.distances,self.reward], feed_dict=feed)
 
         # Train step
-        loss, train_step = sess.run([self.loss,self.train_step],feed_dict=feed)
+        if self.step==0:
+            loss1, train_step1 = sess.run([self.loss1,self.train_step1],feed_dict=feed)
+        else:
+            loss1, train_step1, loss2, train_step2= sess.run([self.loss1,self.train_step1,self.loss2,self.train_step2],feed_dict=feed)
+
         self.step+=1
 
-        # Update baseline
         if self.step%100==0:
-            self.baseline+=1
+            self.ptr.temperature*=self.temperature_decay
 
-        return seq_input, permutation, circuit_length, cities_visited, reward, seq_proba, loss, train_step
+        return seq_input, permutation, seq_proba, b_s, trip, circuit_length, reward
 
 
 
@@ -193,12 +235,17 @@ def train():
     # Config
     args={}
     args['batch_size']=32
-    args['max_length']=6
+    args['max_length']=5
     args['input_dimension']=2
-    args['init_baseline']=25
-    args['input_embed']=32
+    args['input_embed']=16
+
+    args['init_bias_c']=-args['max_length']/2
+
     args['num_neurons']=256
-    args['init_range']=0.1
+    args['init_range']=1
+
+    args['temperature_decay']=1
+
 
     # Build Model and Reward
     print("Initializing the Model...")
@@ -213,28 +260,55 @@ def train():
         print('Config:')
         print('* Batch size:',model.batch_size)
         print('* Sequence length:',model.max_length)
-        print('* City dimension:',model.input_dimension)
-        print('* Embedding:',model.input_embed)
-        print('* Num neurons (Encoder & Decoder LSTM cell):',model.num_neurons)
+        print('* City coordinates:',model.input_dimension)
+        print('* City dimension:',model.input_new_dimension)
+        print('* Input embedding:',model.input_embed)
+        print('* Num neurons (Actor & critic):',model.num_neurons)
         print('\n')
 
-        for i in tqdm(range(500)): # epoch i
+        avg_ac_deviation = []
+        avg_seq_proba = []
 
-            seq_input, permutation, circuit_length, cities_visited, reward, seq_proba, loss, train_step = model.run_episode(sess)
+        for i in tqdm(range(100)): # epoch i
 
-            if i % 100 == 0:
+            seq_input, permutation, seq_proba, b_s, trip, circuit_length, reward = model.run_episode(sess)
+
+            # Store Actor-Critic deviation & seq proba
+            avg_ac_deviation.append(sess.run(tf.reduce_mean(100*(reward-b_s)/circuit_length)))
+            avg_seq_proba.append(sess.run(tf.reduce_mean(seq_proba)))
+
+
+            if i % 10 == 0:
                 #print('\n Input: \n', seq_input)
                 #print('\n Permutation: \n', permutation)
+                #print('\n Seq proba: \n', seq_proba)
+                #print('\n Critic baseline: \n', b_s)
+                #print('\n Trip : \n', trip)
                 #print('\n Circuit length: \n',circuit_length)
-                print('\n Average number of cities visited :', sess.run(tf.reduce_mean(tf.cast(cities_visited,tf.float32))))
-                print(' Baseline :', model.baseline)
-                print(' Average Reward:', sess.run(tf.reduce_mean(reward)))
-                print(' Loss:', loss)
-                #print('\n Log softmax: \n', sess.run(self.ptr.log_softmax,feed_dict=feed))
+                #print('\n Reward : \n', reward)
+
+                #print('  Average seq proba :',sess.run(tf.reduce_mean(seq_proba,0)))
+                print('  Average seq proba :',sess.run(tf.reduce_mean(seq_proba)))
+                print(' Average circuit length :',sess.run(tf.reduce_mean(circuit_length)))
+                print(' Average baseline :', sess.run(-tf.reduce_mean(b_s)))
+                print(' Average deviation:', sess.run(tf.reduce_mean(100*(reward-b_s)/circuit_length)))
                 print('\n')
 
             if i % 1000 == 0 and not(i == 0):
                 saver.save(sess,"save/" +str(i) +".ckpt")
+
+        plt.figure(1)
+        plt.subplot(211)
+        plt.plot(avg_ac_deviation)
+        plt.ylabel('Critic average deviation (%)')
+        plt.xlabel('Epoch')
+
+        plt.subplot(212)
+        plt.plot(avg_seq_proba)
+        plt.ylabel('Actor average seq proba')
+        plt.xlabel('Epoch')
+        plt.show()
+
 
         print('\n Trainable variables')
         for v in tf.trainable_variables():
