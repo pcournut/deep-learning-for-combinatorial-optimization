@@ -8,6 +8,17 @@ from dataset import DataGenerator
 from solver import Solver
 from config import get_config, print_config
 
+# Tensor summaries for TensorBoard visualization
+def variable_summaries(name,var, with_max_min=True):
+  with tf.name_scope(name):
+    mean = tf.reduce_mean(var)
+    tf.summary.scalar('mean', mean)
+    with tf.name_scope('stddev'):
+      stddev = tf.sqrt(tf.reduce_mean(tf.square(var - mean)))
+    tf.summary.scalar('stddev', stddev)
+    if with_max_min == True:
+        tf.summary.scalar('max', tf.reduce_max(var))
+        tf.summary.scalar('min', tf.reduce_min(var))
 
 
 class Critic(object):
@@ -30,15 +41,20 @@ class Critic(object):
         self.lr_decay_step = config.lr2_decay_step
         self.lr_decay_rate = config.lr2_decay_rate
 
-
+        # Feed
         self.input_description = tf.placeholder(tf.float32, [self.batch_size, self.max_length, self.n_components], name="input_description")
         self.initial_tour_length = tf.placeholder(tf.float32, [self.batch_size, 1], name="initial_tour_length")
-        self.target = tf.placeholder(tf.float32, [self.batch_size, 1], name="target")
+        self.optimal_tour_length = tf.placeholder(tf.float32, [self.batch_size, 1], name="target")
+
+        self.optimal_improvement = (self.initial_tour_length - self.optimal_tour_length)/self.initial_tour_length
+        self.optimal_reward = 2*tf.sigmoid(10*self.optimal_improvement)-1
 
         with tf.name_scope('critic'):
-            self.build_prediction('cnn')
+            self.build_prediction('rnn')
         with tf.name_scope('optimizer'):
             self.build_optim()
+
+        self.merged = tf.summary.merge_all()
 
 
     def build_prediction(self,nn_type='cnn'):
@@ -75,8 +91,9 @@ class Critic(object):
             a3=(2/(1024))**0.5
             W_fc3 = tf.Variable(tf.truncated_normal([1024,1], stddev=a3))  # TODO # Weights of the fully connected layer
             b_fc3 = tf.Variable(tf.constant(self.init_bias_c, shape=[1])) # TODO # Biases of the fully connected layer
-            #self.predicted_tour_length = tf.matmul(self.hidden_layer1, W_fc3) + b_fc3 # [batch_size * 1]
-            self.predicted_reward = 2*tf.sigmoid(tf.matmul(self.hidden_layer1, W_fc3) + b_fc3) - 1
+            self.predicted_tour_length = tf.matmul(self.hidden_layer1, W_fc3) + b_fc3 # [batch_size * 1]
+            self.predicted_improvement = (self.initial_tour_length - self.predicted_tour_length) / self.initial_tour_length
+            self.predicted_reward = 2*tf.sigmoid(10*self.predicted_improvement) - 1
 
             """
             a4=(2/(32))**0.5
@@ -141,12 +158,10 @@ class Critic(object):
             with tf.name_scope("output"):
                 W = tf.Variable(tf.truncated_normal([num_filters_total, 1], stddev=0.1), name="W")
                 b = tf.Variable(tf.constant(self.init_bias_c, shape=[1]), name="b")
-                self.predicted_tour_length = tf.matmul(self.h_pool_flat, W) + b
+                self.predicted_tour_length = tf.matmul(self.h_pool_flat, W) + b # [batch_size * 1]
+                self.predicted_improvement = (self.initial_tour_length - self.predicted_tour_length) / self.initial_tour_length
+                self.predicted_reward = 2*tf.sigmoid(10*self.predicted_improvement) - 1
                 
-                #self.predicted_tour_length = tf.argmax(self.scores, 1, name="predictions")
-                #self.predicted_tour_length = tf.cast(self.predicted_tour_length, tf.float32)
-
-            #self.predicted_tour_length=tf.stack([self.predicted_tour_length,1-self.predicted_tour_length],1)
 
         
         if nn_type == 'rnn':  
@@ -181,11 +196,8 @@ class Critic(object):
             ampli_c3 = tf.Variable(tf.constant(10.0, shape=[1])) #####################################################
 
             self.predicted_tour_length = ampli_c3*logits+bias_c3 # initialize in [-100,0]
-
-
-        #self.predicted_improvement = (self.initial_tour_length - self.predicted_tour_length)/self.initial_tour_length   
-        self.optimal_improvement = (self.initial_tour_length - self.target)/self.initial_tour_length
-        self.optimal_reward = 2*tf.sigmoid(10*self.optimal_improvement)-1
+            self.predicted_improvement = (self.initial_tour_length - self.predicted_tour_length) / self.initial_tour_length
+            self.predicted_reward = 2*tf.sigmoid(10*self.predicted_improvement) - 1
 
 
     def build_optim(self):
@@ -197,7 +209,7 @@ class Critic(object):
         self.opt = tf.train.AdamOptimizer(learning_rate=self.lr,beta1=0.9,beta2=0.99, epsilon=0.00001) #####################################################
         
         # Loss
-        self.loss = tf.reduce_sum(tf.square(self.predicted_reward - self.optimal_reward),0)/self.batch_size
+        self.loss = tf.reduce_sum(tf.square(self.predicted_tour_length - self.optimal_tour_length),0)/self.batch_size
         #self.loss = tf.reduce_sum(tf.square(self.predicted_improvement - self.optimal_improvement),0)/self.batch_size
         
         # Minimize step
@@ -236,35 +248,38 @@ if __name__ == "__main__":
             # Generate instances
             training_set = DataGenerator(solver)
             coord_batch, dist_batch, input_batch, initial_tour_length = training_set.next_batch(batch_size, max_length, input_dimension, scale, n_components)
-            target = training_set.solve_batch(coord_batch)
-            #optimal_improvement = (initial_tour_length - optimal_tour_length) / initial_tour_length
-            #input_description = tf.concat([input_batch,initial_tour_length],0)
+            optimal_tour_length = training_set.solve_batch(coord_batch)
+
 
             # Construct feed_dict
-            # y = [[(initial_tour_length - solver.run(dist_mat))/initial_tour_length] for dist_mat in dist_batch]
-            feed = {critic.input_description: input_batch, critic.initial_tour_length: initial_tour_length, critic.target: target}
+            feed = {critic.input_description: input_batch, critic.initial_tour_length: initial_tour_length, critic.optimal_tour_length: optimal_tour_length}
 
             # Run session
-            predicted_reward, optimal_reward, loss, train_step = sess.run([critic.predicted_reward, critic.optimal_reward, critic.loss, critic.train_step], feed_dict=feed)
+            predicted_tour_length, loss, train_step = sess.run([critic.predicted_tour_length, critic.loss, critic.train_step], feed_dict = feed)
             #predicted_improvement, optimal_improvement, loss, train_step = sess.run([critic.predicted_improvement, critic.optimal_improvement, critic.loss, critic.train_step], feed_dict=feed)
+            #predicted_reward, optimal_reward, loss, train_step = sess.run([critic.predicted_reward, critic.optimal_reward, critic.loss, critic.train_step], feed_dict=feed)
 
             average_loss += loss[0]
             if i > 898:
                 test_loss += loss[0]
 
             if i == 0:
-                #print "\n Initial tour length: ", initial_tour_length
-                #print "\n Predicted tour length:", predicted_tour_length
-                #print "\n Optimal tour length:", optimal_tour_length
-                print "\n Predicted reward:", predicted_reward
-                print "\n Optimal reward:", optimal_reward
+                print "\n Initial tour length: ", initial_tour_length
+                print "\n Predicted tour length:", predicted_tour_length
+                print "\n Optimal tour length:", optimal_tour_length
+                #print "\n Predicted improvement:", predicted_improvement
+                #print "\n Optimal improvement:", optimal_improvement
+                #print "\n Predicted reward:", predicted_reward
+                #print "\n Optimal reward:", optimal_reward
                 print "\n Initial loss: ", average_loss
             if i%50 == 0 and i != 0:
-                #print "\n Initial tour length: ", initial_tour_length
-                #print "\n Predicted tour length:", predicted_tour_length
-                #print "\n Optimal tour length:", optimal_tour_length
-                print "\n Predicted improvement:", predicted_reward
-                print "\n Optimal improvement:", optimal_reward
+                print "\n Initial tour length: ", initial_tour_length
+                print "\n Predicted tour length:", predicted_tour_length
+                print "\n Optimal tour length:", optimal_tour_length
+                #print "\n Predicted improvement:", predicted_improvement
+                #print "\n Optimal improvement:", optimal_improvement
+                #print "\n Predicted reward:", predicted_reward
+                #print "\n Optimal reward:", optimal_reward
                 print "\n Loss: ", average_loss/50
                 average_loss = 0
 
